@@ -1,0 +1,6 @@
+import { jsx as _jsx, jsxs as _jsxs } from "react/jsx-runtime";
+import { CheckCircle2, AlertTriangle } from 'lucide-react';
+export function PulsePanel({ pulse }) {
+    const limitOk = !pulse.tooLong;
+    return (_jsxs("section", { className: "rounded-xl border border-slate-200 bg-white p-6 shadow-sm", children: [_jsxs("div", { className: "flex items-center justify-between", children: [_jsx("h2", { className: "text-lg font-semibold text-slate-900", children: "Weekly Product Pulse" }), _jsxs("span", { className: `flex items-center gap-1.5 text-sm font-medium ${limitOk ? 'text-emerald-600' : 'text-rose-600'}`, children: [limitOk ? _jsx(CheckCircle2, { className: "h-4 w-4" }) : _jsx(AlertTriangle, { className: "h-4 w-4" }), pulse.wordCount, " / 250 words"] })] }), _jsx("p", { className: "mt-1 text-sm text-slate-500", children: pulse.title }), _jsx("div", { className: "mt-4 rounded-lg border border-slate-200 bg-slate-50 p-4", children: _jsx("p", { className: "text-sm leading-relaxed text-slate-800", children: pulse.body }) }), pulse.tooLong && (_jsx("p", { className: "mt-2 text-sm text-rose-600", children: "The pulse exceeds the 250-word limit. Trim the content before exporting." }))] }));
+}
