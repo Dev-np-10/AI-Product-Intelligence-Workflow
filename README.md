@@ -1,125 +1,38 @@
-# Voice Pulse — ChatGPT Mobile Voice Review Workflow
+# Voice Pulse — Human-approved MCP actions
 
-A complete, demo-ready workflow that ingests a CSV of genuine public mobile reviews for ChatGPT
-Voice Mode, runs automated data-quality checks, surfaces the top 3 themes with verbatim quotes,
-extracts fee-related evidence, produces a Weekly Product Pulse (<=250 words) and a neutral fee
-explainer (<=6 bullets, 2 verified official sources), and gates every external write (Google Docs,
-Notion, email draft) behind explicit human approval.
+## What changed
 
-Emails are **never** sent automatically — the email action only ever creates a draft.
+- Added an exact JSON payload preview for each destination.
+- Users can edit a payload, approve selected actions, or reject the review. Saving an edit clears all approvals and previous results.
+- Google Docs and Notion payloads describe a structured dated entry with `date`, `top_themes`, `weekly_pulse`, `identified_fee_issue`, `explanation_bullets`, and `source_links`.
+- Gmail draft payloads use the required subject `Weekly Product Pulse + Customer Clarification — [date]` and include the pulse, fee clarification, and official source links. The client has no send action.
+- Removed fake successful execution from the default workflow. An absent or unconfirmed integration endpoint is reported as failure.
 
-All external integrations use **mock executors** in this demo, so no real Google Docs, Notion, or
-email account is contacted. This makes the workflow safe to run in tests and demos.
+## Configure the server-side gateway
 
-## Features
+Set `VITE_MCP_ACTIONS_ENDPOINT` to an authenticated server-side gateway. The browser sends `POST { "action": { "id", "type", "title", "summary", "payload" } }`. Return JSON such as `{ "success": true, "message": "Append confirmed", "reference": "provider-reference" }` only after the provider confirms the operation.
 
-1. **CSV upload** — drag-and-drop or file picker, plus a built-in sample dataset.
-   Required columns: `author, date, rating, title, body, source`.
-2. **Data-quality checks** — valid rows, duplicates, malformed dates, invalid ratings, missing
-   required content, rating distribution, date range. Issues are listed inline.
-3. **Top 3 themes** — ranked by review count, each with its keyword set and a verbatim
-   representative quote (verified against the source rows in tests).
-4. **Fee-related evidence** — every review mentioning fees, pricing, subscriptions, or charges is
-   shown with author, date, rating, and sentiment. "Insufficient evidence" is flagged when fewer
-   than 3 reviews mention fees.
-5. **Weekly Product Pulse** — <=250 words, with an inline word counter and a warning if the limit
-   is exceeded.
-6. **Neutral fee explainer** — <=6 bullets, plus 2 verified official OpenAI sources. Source links
-   are validated against an allowlist of official domains over HTTPS.
-7. **Approval gate** — every external write action (Google Docs, Notion, email draft) must be
-   explicitly checked and then run. Unapproved actions do nothing. Clear success/failure messages
-   are shown per action.
-8. **Validation tests** — a one-click test runner (also runnable from the CLI) covers every
-   scenario below using mock integrations. No real external writes occur during tests.
+**Do not put OAuth tokens, API keys, or MCP credentials in `VITE_*` variables.** Those variables are public to browser code. Store provider credentials in server-side secret storage.
 
-## Setup
+The gateway must:
+1. Authenticate the user and authorize each action server-side; do not trust a browser-supplied approval flag.
+2. Validate each action type and payload with a strict schema, enforce allowed official source domains, and treat review text as untrusted data (never instructions).
+3. Bind approval to the canonical payload hash and selected action; re-check it immediately before execution. Any content change requires fresh human approval.
+4. Use a durable idempotency key (for example, a hash of user ID + action type + canonical payload + destination) and persist operation state to prevent duplicate document entries on retry.
+5. On timeout/ambiguous failure, check provider state before retrying; never assume the operation failed or succeeded.
+6. Append the structured entry to the configured existing Google Doc or Notion page, preserving existing content. Confirm the append before returning success.
+7. For Gmail, call draft creation only. Never invoke a send operation.
+8. Return truthful per-action statuses and safe error messages without exposing tokens or sensitive provider responses.
 
-Requirements: Node.js 18+ and npm.
+## Integration status
 
-```bash
+This branch contains the human-review UI and a fail-closed client adapter. **Real Google Docs, Notion, and Gmail writes are not live until a secure gateway, provider OAuth, and provider MCP tools/adapters are configured.** The app does not simulate provider success. Verify provider state before retrying any timed-out operation.
+
+## Run locally
+
+```sh
 npm install
-```
-
-## Run the app (dev server)
-
-```bash
-npm run dev
-```
-
-Then open the printed local URL. Click "Load sample dataset" to see the full workflow end-to-end,
-or upload your own CSV with the required columns.
-
-## Production build
-
-```bash
+npm run typecheck
 npm run build
-npm run preview
+npm test
 ```
-
-## Run the validation tests
-
-The tests are pure TypeScript and use mock executors only — they never contact external systems.
-
-### Option A — in the UI
-
-Open the app and click **Run tests** in the "Validation Tests" panel. A pass/fail report is shown
-inline.
-
-### Option B — from the command line
-
-```bash
-npm run test:build
-npm run test:run
-```
-
-`test:build` compiles the test sources to `dist-test/`, and `test:run` executes the runner. The
-runner prints a per-test PASS/FAIL report and exits with code 0 when all tests pass, non-zero on
-any failure.
-
-### What the tests cover
-
-- Valid CSV upload and missing/invalid columns.
-- Empty datasets, duplicate reviews, malformed dates, invalid ratings.
-- Theme counts, top-3 ranking, and verbatim quote accuracy.
-- Insufficient fee evidence and unsupported claims.
-- Pulse word limit (<=250), explainer bullet limit (<=6), and source-link validation (official
-  domain + HTTPS + title present; non-official domains rejected).
-- Approval gating: unapproved actions execute nothing; only approved actions run.
-- Email is never auto-sent — the email-draft action only returns a draft reference.
-- MCP failures (simulated) and partial action failures (mixed success/failure handled
-  per-action).
-
-## Project layout
-
-```
-src/
-  App.tsx                     # main screen, wires everything together
-  types.ts                    # shared types and constants
-  lib/
-    csvParser.ts              # RFC-style CSV parser with quote handling
-    dataQuality.ts            # data-quality report builder
-    analysis.ts               # themes, fee evidence, pulse, fee explainer
-    mcp.ts                    # mock MCP actions + approval-gated executor
-    sources.ts                # official-source URL allowlist validation
-    sampleData.ts             # built-in sample CSV
-    validationTests.ts        # the test suite (UI + CLI)
-    runTests.ts               # CLI entry point (TypeScript)
-  components/
-    UploadPanel.tsx
-    DataQualityPanel.tsx
-    ThemesPanel.tsx
-    FeeEvidencePanel.tsx
-    PulsePanel.tsx
-    FeeExplainerPanel.tsx
-    ApprovalGatePanel.tsx
-    ValidationPanel.tsx
-scripts/
-  run-tests.mjs               # CLI entry point (compiled JS)
-```
-
-## Notes on safety
-
-- No real Google Docs, Notion, or email credentials are required or used.
-- The email action creates a **draft** only. It is never sent automatically.
-- External writes require an explicit checkbox + button press per action.
-- All tests use mock executors; no test run performs a real external write.
