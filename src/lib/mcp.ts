@@ -133,7 +133,7 @@ export const mockMcpExecutor: McpExecutor = async (action) => ({
   actionId: action.id,
   success: true,
   message: `TEST ONLY: simulated ${action.type} success; no provider was contacted.`,
-  mockRef: `test-only-${action.type}`,
+  mockRef: `mock-${action.type}-test-only`,
 });
 
 export const failingMockMcpExecutor: McpExecutor = async (action) => ({
