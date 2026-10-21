@@ -128,6 +128,20 @@ export const configuredMcpExecutor: McpExecutor = async (action) => {
   };
 };
 
+// Test-only executors for the in-app validation suite. The production app never uses these.
+export const mockMcpExecutor: McpExecutor = async (action) => ({
+  actionId: action.id,
+  success: true,
+  message: `TEST ONLY: simulated ${action.type} success; no provider was contacted.`,
+  mockRef: `test-only-${action.type}`,
+});
+
+export const failingMockMcpExecutor: McpExecutor = async (action) => ({
+  actionId: action.id,
+  success: false,
+  message: `TEST ONLY: simulated ${action.type} failure; no provider was contacted.`,
+});
+
 export async function executeMcpActions(
   actions: McpAction[],
   approvedIds: Set<string>,
