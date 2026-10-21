@@ -1,168 +1,399 @@
-import { useCallback, useMemo, useState } from 'react';
-import { BarChart3, ShieldCheck } from 'lucide-react';
-import type { McpAction, McpResult, ValidationReport } from '@/types';
-import { parseCsv } from '@/lib/csvParser';
-import { computeDataQuality } from '@/lib/dataQuality';
-import { buildFeeExplainer, buildPulseReport, extractFeeEvidence, topThemes } from '@/lib/analysis';
-import { buildMcpActions, executeMcpActions, configuredMcpExecutor } from '@/lib/mcp';
-import { runValidationTests } from '@/lib/validationTests';
-import { UploadPanel } from '@/components/UploadPanel';
-import { DataQualityPanel } from '@/components/DataQualityPanel';
-import { ThemesPanel } from '@/components/ThemesPanel';
-import { FeeEvidencePanel } from '@/components/FeeEvidencePanel';
-import { PulsePanel } from '@/components/PulsePanel';
-import { FeeExplainerPanel } from '@/components/FeeExplainerPanel';
-import { ApprovalGatePanel } from '@/components/ApprovalGatePanel';
-import { ValidationPanel } from '@/components/ValidationPanel';
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
 
-function App() {
-  const [parsedRows, setParsedRows] = useState<ReturnType<typeof parseCsv> | null>(null);
-  const [approvalError, setApprovalError] = useState<string | null>(null);
-  const [approvedIds, setApprovedIds] = useState<Set<string>>(new Set());
-  const [editedPayloads, setEditedPayloads] = useState<Record<string, unknown>>({});
-  const [mcpResults, setMcpResults] = useState<Record<string, McpResult>>({});
-  const [pendingIds, setPendingIds] = useState<Set<string>>(new Set());
-  const [executing, setExecuting] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [validationReport, setValidationReport] = useState<ValidationReport | null>(null);
-  const [validationRunning, setValidationRunning] = useState(false);
+import React, { useEffect, useMemo, useState } from 'react';
+import {
+  ApprovalRecord,
+  ApprovalStatus,
+  DataQualityReport,
+  FeeEvidenceItem,
+  McpActionResult,
+  McpDestinationConfig,
+  NeutralFeeExplainer,
+  ReviewRow,
+  Theme,
+  WeeklyProductPulse,
+} from './types';
+import { processReviewsCSV } from './utils/csvParser';
+import { extractFeeEvidence, extractTopThemes } from './utils/analyzer';
+import {
+  generateNeutralFeeExplainer,
+  generateWeeklyProductPulse,
+} from './utils/pulseGenerator';
+import { HEALTHY_VOICE_REVIEWS_CSV } from './utils/sampleData';
+import { generateContentHash } from './utils/sanitizer';
+import { buildMcpPayload, executeMcpActions, formatEntryForGoogleDoc } from './services/mcpClient';
 
-  const handleCsv = useCallback((csv: string, _fileName: string) => {
-    setLoading(true);
-    setApprovalError(null);
-    setApprovedIds(new Set());
-    setEditedPayloads({});
-    setMcpResults({});
-    setPendingIds(new Set());
-    setParsedRows(parseCsv(csv));
-    setLoading(false);
-  }, []);
+import { Header } from './components/Header';
+import { UploadSection } from './components/UploadSection';
+import { DataQualityCard } from './components/DataQualityCard';
+import { ThemesAndEvidenceView } from './components/ThemesAndEvidenceView';
+import { WeeklyPulseCard } from './components/WeeklyPulseCard';
+import { HumanApprovalGate } from './components/HumanApprovalGate';
+import { McpDispatchDrawer } from './components/McpDispatchDrawer';
+import { EditPulseModal } from './components/EditPulseModal';
+import { GoogleDocAppendModal } from './components/GoogleDocAppendModal';
 
-  const report = useMemo(() => parsedRows
-    ? computeDataQuality(parsedRows.rows, parsedRows.errors, parsedRows.missingRequiredColumns)
-    : null, [parsedRows]);
-  const rows = parsedRows?.rows ?? [];
-  const themes = useMemo(() => topThemes(rows, 3), [rows]);
-  const feeEvidence = useMemo(() => extractFeeEvidence(rows), [rows]);
-  const pulse = useMemo(() => rows.length > 0 ? buildPulseReport(rows, themes, feeEvidence) : null, [rows, themes, feeEvidence]);
-  const explainer = useMemo(() => buildFeeExplainer(), []);
+export default function App() {
+  const currentDate = '2026-10-21';
 
-  const baseActions = useMemo<McpAction[]>(() => {
-    if (!pulse || rows.length === 0) return [];
-    const identifiedFeeIssue = feeEvidence.items.length
-      ? `${feeEvidence.totalFeeMentions} fee-related review mention(s) detected; review the evidence before treating these as a confirmed product issue.`
-      : 'No fee-related issue detected in the supplied review sample.';
-    return buildMcpActions({
-      pulseTitle: pulse.title,
-      pulseBody: pulse.body,
-      feeExplainerBullets: explainer.bullets,
-      feeExplainerSources: explainer.sources.map((source) => ({ title: source.title, url: source.url })),
-      topThemes: themes.map((theme) => ({ name: theme.name, count: theme.count })),
-      identifiedFeeIssue,
+  // --- CSV Ingestion State ---
+  const [rawCSV, setRawCSV] = useState<string>(HEALTHY_VOICE_REVIEWS_CSV);
+  const [activeDatasetName, setActiveDatasetName] = useState<string>('Genuine Reviews (Healthy)');
+
+  // --- Parsed Data & Analysis ---
+  const [reviews, setReviews] = useState<ReviewRow[]>([]);
+  const [qualityReport, setQualityReport] = useState<DataQualityReport | null>(null);
+  const [topThemes, setTopThemes] = useState<Theme[]>([]);
+  const [feeEvidence, setFeeEvidence] = useState<{
+    items: FeeEvidenceItem[];
+    hasSufficientEvidence: boolean;
+    unsupportedClaims: string[];
+  }>({ items: [], hasSufficientEvidence: false, unsupportedClaims: [] });
+
+  // --- Generated Pulse & Fee Explainer ---
+  const [pulse, setPulse] = useState<WeeklyProductPulse | null>(null);
+  const [explainer, setExplainer] = useState<NeutralFeeExplainer | null>(null);
+
+  // --- Human Approval State Machine ---
+  const [approvalRecord, setApprovalRecord] = useState<ApprovalRecord>({
+    status: 'PENDING_REVIEW',
+    contentHash: '',
+    approvedDestinations: { google_docs: true, notion: true, gmail_draft: true },
+  });
+  const [approvalInvalidatedNotice, setApprovalInvalidatedNotice] = useState<string | undefined>(undefined);
+
+  // --- Target MCP Destinations ---
+  const [destinations, setDestinations] = useState<McpDestinationConfig>({
+    google_docs: true,
+    notion: true,
+    gmail_draft: true,
+    google_docs_url: '',
+  });
+
+  // --- MCP Simulation & Execution State ---
+  const [simulationConfig, setSimulationConfig] = useState({
+    simulateAuthError: false,
+    simulateTimeout: false,
+    simulatePartialFailure: false,
+  });
+  const [isExecutingMcp, setIsExecutingMcp] = useState(false);
+  const [mcpResults, setMcpResults] = useState<McpActionResult[]>([]);
+
+  // --- Modals State ---
+  const [isEditModalOpen, setIsEditModalOpen] = useState(false);
+  const [isDocModalOpen, setIsDocModalOpen] = useState(false);
+
+  // --- Process CSV on rawCSV change ---
+  useEffect(() => {
+    const { reviews: parsedReviews, report } = processReviewsCSV(rawCSV);
+    setReviews(parsedReviews);
+    setQualityReport(report);
+
+    const themes = extractTopThemes(parsedReviews);
+    setTopThemes(themes);
+
+    const fee = extractFeeEvidence(parsedReviews);
+    setFeeEvidence(fee);
+
+    const newPulse = generateWeeklyProductPulse(currentDate, themes, fee.hasSufficientEvidence);
+    setPulse(newPulse);
+
+    const newExplainer = generateNeutralFeeExplainer(fee.hasSufficientEvidence);
+    setExplainer(newExplainer);
+
+    // Compute initial content hash and reset approval to PENDING
+    const initialHash = generateContentHash(newPulse.fullPulseText + newExplainer.bullets.join(''));
+    setApprovalRecord({
+      status: 'PENDING_REVIEW',
+      contentHash: initialHash,
+      approvedDestinations: { google_docs: true, notion: true, gmail_draft: true },
     });
-  }, [pulse, rows.length, explainer, themes, feeEvidence]);
+    setApprovalInvalidatedNotice(undefined);
+    setMcpResults([]);
+  }, [rawCSV]);
 
-  const mcpActions = useMemo(() => baseActions.map((action) =>
-    Object.prototype.hasOwnProperty.call(editedPayloads, action.id)
-      ? { ...action, payload: editedPayloads[action.id] }
-      : action,
-  ), [baseActions, editedPayloads]);
+  // Current Content Hash dynamically computed based on active text
+  const currentContentHash = useMemo(() => {
+    if (!pulse || !explainer) return '';
+    return generateContentHash(pulse.fullPulseText + explainer.bullets.join(''));
+  }, [pulse, explainer]);
 
-  const toggleApproval = useCallback((id: string) => {
-    setApprovalError(null);
-    setApprovedIds((previous) => {
-      const next = new Set(previous);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
+  // Handle Loading a Dataset
+  const handleLoadCSV = (content: string, name: string) => {
+    setRawCSV(content);
+    setActiveDatasetName(name);
+  };
+
+  // Reset back to healthy benchmark
+  const handleResetToHealthy = () => {
+    setRawCSV(HEALTHY_VOICE_REVIEWS_CSV);
+    setActiveDatasetName('Genuine Reviews (Healthy)');
+    setSimulationConfig({
+      simulateAuthError: false,
+      simulateTimeout: false,
+      simulatePartialFailure: false,
+    });
+  };
+
+  // Human Approval Actions
+  const handleApprove = () => {
+    if (!pulse || !explainer) return;
+    setApprovalRecord({
+      status: 'APPROVED',
+      approvedAt: new Date().toISOString(),
+      approvedBy: 'Product Lead (HITL Sign-off)',
+      contentHash: currentContentHash,
+      approvedDestinations: { ...destinations },
+    });
+    setApprovalInvalidatedNotice(undefined);
+  };
+
+  const handleReject = () => {
+    setApprovalRecord(prev => ({
+      ...prev,
+      status: 'REJECTED',
+      rejectionReason: 'Rejected during human review: requires copy revision.',
+    }));
+    setApprovalInvalidatedNotice(undefined);
+  };
+
+  // Save Edits - Critical Rule: Any edit invalidates previous approval!
+  const handleSaveEdits = (updatedPulse: WeeklyProductPulse, updatedExplainer: NeutralFeeExplainer) => {
+    setPulse(updatedPulse);
+    setExplainer(updatedExplainer);
+    setIsEditModalOpen(false);
+
+    const newHash = generateContentHash(updatedPulse.fullPulseText + updatedExplainer.bullets.join(''));
+
+    // Invalidate approval state
+    setApprovalRecord({
+      status: 'PENDING_REVIEW',
+      contentHash: newHash,
+      approvedDestinations: { ...destinations },
+      invalidatedNotice: 'Content was modified; previous approval was invalidated. Please review and approve again before dispatching.',
+    });
+
+    setApprovalInvalidatedNotice(
+      'Content was modified; previous approval has been automatically invalidated. Please review and re-approve before dispatching.'
+    );
+  };
+
+  // Toggle MCP destination checkbox
+  const handleToggleDestination = (key: keyof McpDestinationConfig) => {
+    setDestinations(prev => {
+      const next = { ...prev, [key]: !prev[key] };
+      // If approval was already granted, changing destinations also invalidates approval
+      if (approvalRecord.status === 'APPROVED') {
+        setApprovalRecord(r => ({
+          ...r,
+          status: 'PENDING_REVIEW',
+        }));
+        setApprovalInvalidatedNotice('Target MCP destinations changed; previous approval invalidated. Please re-approve.');
+      }
       return next;
     });
-  }, []);
+  };
 
-  const editPayload = useCallback((id: string, payload: unknown) => {
-    setEditedPayloads((previous) => ({ ...previous, [id]: payload }));
-    // Any edit changes the exact approved content: invalidate every prior approval and result.
-    setApprovedIds(new Set());
-    setMcpResults({});
-    setApprovalError('Content changed. All approvals were cleared; review the updated payload and approve again.');
-  }, []);
-
-  const rejectAll = useCallback(() => {
-    setApprovedIds(new Set());
-    setMcpResults({});
-    setApprovalError('Review rejected. No external action was run.');
-  }, []);
-
-  const handleExecute = useCallback(async () => {
-    if (approvedIds.size === 0) {
-      setApprovalError('Approve the exact content of at least one action before it can run.');
-      return;
+  // Update Google Doc URL from user input
+  const handleUpdateGoogleDocsUrl = (url: string) => {
+    setDestinations(prev => ({
+      ...prev,
+      google_docs_url: url,
+    }));
+    if (approvalRecord.status === 'APPROVED') {
+      setApprovalRecord(r => ({
+        ...r,
+        status: 'PENDING_REVIEW',
+      }));
+      setApprovalInvalidatedNotice('Target Google Doc URL changed; previous approval invalidated. Please re-approve.');
     }
-    setExecuting(true);
-    setApprovalError(null);
-    setPendingIds(new Set(approvedIds));
-    setMcpResults({});
+  };
+
+  const handleUpdateGoogleDocsWebhook = (webhookUrl: string) => {
+    setDestinations(prev => ({
+      ...prev,
+      google_docs_webhook_url: webhookUrl,
+    }));
+  };
+
+  const handleUpdateGoogleDocsBearerToken = (token: string) => {
+    setDestinations(prev => ({
+      ...prev,
+      google_docs_bearer_token: token,
+    }));
+  };
+
+  const handleUpdateGoogleDocsMode = (mode: 'live_webhook' | 'live_oauth' | 'clipboard_assistant') => {
+    setDestinations(prev => ({
+      ...prev,
+      google_docs_mode: mode,
+    }));
+  };
+
+  // Toggle failure simulation flags
+  const handleToggleSimulation = (key: 'simulateAuthError' | 'simulateTimeout' | 'simulatePartialFailure') => {
+    setSimulationConfig(prev => ({
+      ...prev,
+      [key]: !prev[key],
+    }));
+  };
+
+  // Execute Approved MCP Dispatch
+  const handleExecuteMcp = async () => {
+    if (!pulse || !explainer) return;
+
+    setIsExecutingMcp(true);
     try {
-      const results = await executeMcpActions(mcpActions, approvedIds, configuredMcpExecutor);
-      const byId: Record<string, McpResult> = {};
-      results.forEach((result) => { byId[result.actionId] = result; });
-      setMcpResults(byId);
-    } finally {
-      setPendingIds(new Set());
-      setExecuting(false);
-    }
-  }, [approvedIds, mcpActions]);
+      const payload = buildMcpPayload(
+        pulse,
+        explainer,
+        topThemes,
+        feeEvidence.hasSufficientEvidence
+          ? 'Customer confusion regarding Plus $20/month daily voice quota vs unmetered expectations'
+          : 'Insufficient fee evidence to substantiate systemic billing issues'
+      );
 
-  const handleRunValidation = useCallback(async () => {
-    setValidationRunning(true);
-    try { setValidationReport(await runValidationTests()); }
-    finally { setValidationRunning(false); }
-  }, []);
-  const datasetReady = rows.length > 0;
+      const results = await executeMcpActions(payload, {
+        destinations,
+        approvalRecord,
+        currentContentHash,
+        simulateAuthError: simulationConfig.simulateAuthError,
+        simulateTimeout: simulationConfig.simulateTimeout,
+        simulatePartialFailure: simulationConfig.simulatePartialFailure,
+      });
+
+      setMcpResults(results);
+
+      // If Google Docs destination was executed in clipboard assist mode,
+      // auto-open the helper modal with direct copy and open buttons
+      const gdocResult = results.find(r => r.tool.includes('google_docs'));
+      if (gdocResult && gdocResult.status === 'SUCCESS' && gdocResult.deliveryMode === 'CLIPBOARD_ASSIST') {
+        setIsDocModalOpen(true);
+      }
+    } catch (err: unknown) {
+      alert(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsExecutingMcp(false);
+    }
+  };
+
+  // Retry failed MCP actions (uses existing idempotency key to prevent duplicates)
+  const handleRetryFailed = async () => {
+    // Re-run execution with partial failure simulation turned off to allow success
+    setSimulationConfig(prev => ({
+      ...prev,
+      simulatePartialFailure: false,
+      simulateAuthError: false,
+      simulateTimeout: false,
+    }));
+    await handleExecuteMcp();
+  };
+
+  const formattedDocPreview = pulse && explainer ? formatEntryForGoogleDoc(
+    buildMcpPayload(
+      pulse,
+      explainer,
+      topThemes,
+      feeEvidence.hasSufficientEvidence
+        ? 'Customer confusion regarding Plus $20/month daily voice quota vs unmetered expectations'
+        : 'Insufficient fee evidence to substantiate systemic billing issues'
+    )
+  ) : '';
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900">
-      <header className="sticky top-0 z-10 border-b border-slate-200 bg-white/80 backdrop-blur">
-        <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-4">
-          <div className="flex items-center gap-2.5">
-            <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-sky-600 text-white"><BarChart3 className="h-5 w-5" /></div>
-            <div><h1 className="text-base font-semibold leading-tight">Voice Pulse</h1><p className="text-xs text-slate-500">ChatGPT Mobile Voice — Weekly Review Workflow</p></div>
-          </div>
-          <div className="flex items-center gap-1.5 rounded-full bg-amber-50 px-3 py-1 text-xs font-medium text-amber-800">
-            <ShieldCheck className="h-3.5 w-3.5" /> Human approval required · Integrations configurable
-          </div>
-        </div>
-      </header>
-      <main className="mx-auto max-w-6xl space-y-6 px-4 py-8">
-        <UploadPanel onCsv={handleCsv} loading={loading} />
-        {parsedRows && parsedRows.missingRequiredColumns.length > 0 && (
-          <div className="rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-800">
-            <p className="font-semibold">CSV is missing required columns.</p>
-            <p className="mt-1">The file must include: <code className="rounded bg-rose-100 px-1 text-xs">{parsedRows.missingRequiredColumns.join(', ')}</code>. Please re-export the CSV and upload again.</p>
-          </div>
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans antialiased">
+      {/* Top App Header */}
+      <Header
+        approvalStatus={approvalRecord.status}
+        onResetToHealthy={handleResetToHealthy}
+        datasetName={activeDatasetName}
+      />
+
+      {/* Main Container */}
+      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+        {/* Section 1: Ingestion & Upload */}
+        <UploadSection
+          onLoadCSV={handleLoadCSV}
+          activeDatasetName={activeDatasetName}
+        />
+
+        {/* Section 2: Data Quality & Hygiene Card */}
+        {qualityReport && <DataQualityCard report={qualityReport} />}
+
+        {/* Section 3: Top 3 Themes & Fee-Related Evidence */}
+        <ThemesAndEvidenceView
+          topThemes={topThemes}
+          feeEvidence={feeEvidence}
+        />
+
+        {/* Section 4: Weekly Product Pulse (≤250 words) & Neutral Fee Explainer (≤6 bullets) */}
+        {pulse && explainer && (
+          <WeeklyPulseCard
+            pulse={pulse}
+            explainer={explainer}
+            approvalStatus={approvalRecord.status}
+            onApprove={handleApprove}
+            onReject={handleReject}
+            onEdit={() => setIsEditModalOpen(true)}
+            approvalInvalidatedNotice={approvalInvalidatedNotice}
+          />
         )}
-        {report && <DataQualityPanel report={report} />}
-        {datasetReady && <div className="grid gap-6 lg:grid-cols-2"><ThemesPanel themes={themes} /><FeeEvidencePanel report={feeEvidence} /></div>}
-        {datasetReady && pulse && <PulsePanel pulse={pulse} />}
-        {datasetReady && <FeeExplainerPanel explainer={explainer} />}
-        {datasetReady && <ApprovalGatePanel
-          actions={mcpActions}
-          approvedIds={approvedIds}
+
+        {/* Section 5: Human Approval Gate & MCP Destination Checkboxes */}
+        <HumanApprovalGate
+          approvalRecord={approvalRecord}
+          currentContentHash={currentContentHash}
+          destinations={destinations}
+          onToggleDestination={handleToggleDestination}
+          onUpdateGoogleDocsUrl={handleUpdateGoogleDocsUrl}
+          onUpdateGoogleDocsWebhook={handleUpdateGoogleDocsWebhook}
+          onUpdateGoogleDocsBearerToken={handleUpdateGoogleDocsBearerToken}
+          onUpdateGoogleDocsMode={handleUpdateGoogleDocsMode}
+          onExecuteMcp={handleExecuteMcp}
+          isExecuting={isExecutingMcp}
+          simulationConfig={simulationConfig}
+          onToggleSimulation={handleToggleSimulation}
+          onOpenDocModal={() => setIsDocModalOpen(true)}
+        />
+
+        {/* Section 6: MCP Action Results & Protocol Inspector Drawer */}
+        <McpDispatchDrawer
           results={mcpResults}
-          pendingIds={pendingIds}
-          onToggleApproval={toggleApproval}
-          onEditPayload={editPayload}
-          onReject={rejectAll}
-          onExecute={handleExecute}
-          executing={executing}
-          disabled={!datasetReady}
-        />}
-        {approvalError && <div role="status" className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">{approvalError}</div>}
-        <ValidationPanel report={validationReport} running={validationRunning} onRun={handleRunValidation} />
-        <footer className="pt-4 text-center text-xs text-slate-400">
-          Voice Pulse · External actions require a configured server-side MCP gateway. Gmail drafts are never sent automatically.
-        </footer>
+          onRetryFailed={handleRetryFailed}
+          isRetrying={isExecutingMcp}
+          onOpenDocModal={() => setIsDocModalOpen(true)}
+        />
       </main>
+
+      {/* Footer */}
+      <footer className="mt-auto border-t border-slate-900 bg-slate-950/80 py-4 text-center text-xs text-slate-500">
+        ChatGPT Voice Pulse &amp; HITL MCP Dispatcher • Safe Sandbox Mode Active • Draft-only Gmail integration
+      </footer>
+
+      {/* Edit Pulse & Explainer Modal */}
+      {pulse && explainer && (
+        <EditPulseModal
+          isOpen={isEditModalOpen}
+          onClose={() => setIsEditModalOpen(false)}
+          pulse={pulse}
+          explainer={explainer}
+          onSave={handleSaveEdits}
+        />
+      )}
+
+      {/* Google Doc Append Helper Modal */}
+      {pulse && explainer && (
+        <GoogleDocAppendModal
+          isOpen={isDocModalOpen}
+          onClose={() => setIsDocModalOpen(false)}
+          formattedText={formattedDocPreview}
+          targetDocUrl={destinations.google_docs_url || ''}
+          date={pulse.date}
+        />
+      )}
     </div>
   );
 }
-export default App;
