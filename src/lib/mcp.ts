@@ -1,14 +1,14 @@
-import type {
-  McpAction,
-  McpActionType,
-  McpResult,
-} from '@/types';
+import type { McpAction, McpActionType, McpResult } from '@/types';
 
 let actionCounter = 0;
-
 export function makeActionId(): string {
   actionCounter += 1;
   return `act-${Date.now()}-${actionCounter}`;
+}
+
+function localDate(): string {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
 }
 
 export function buildMcpActions(params: {
@@ -17,45 +17,57 @@ export function buildMcpActions(params: {
   feeExplainerBullets: string[];
   feeExplainerSources: { title: string; url: string }[];
   topThemes: { name: string; count: number }[];
+  identifiedFeeIssue?: string;
   recipient?: string;
 }): McpAction[] {
   const { pulseTitle, pulseBody, feeExplainerBullets, feeExplainerSources, topThemes, recipient } = params;
+  const date = localDate();
+  const sourceLinks = feeExplainerSources.map((source) => ({ title: source.title, url: source.url }));
+  const feeIssue = params.identifiedFeeIssue ?? 'No specific fee issue was identified from the supplied review data.';
+  const explanation = feeExplainerBullets.slice();
+  const structuredEntry = {
+    date,
+    top_themes: topThemes,
+    weekly_pulse: pulseBody,
+    identified_fee_issue: feeIssue,
+    explanation_bullets: explanation,
+    source_links: sourceLinks,
+  };
 
   const googleDocs: McpAction = {
     id: makeActionId(),
     type: 'google-docs',
-    title: 'Create Google Doc — Weekly Product Pulse',
-    summary: 'Create a Google Doc containing the Weekly Product Pulse (<=250 words) and the neutral fee explainer.',
-    payload: {
-      docTitle: pulseTitle,
-      sections: [
-        { heading: 'Weekly Product Pulse', content: pulseBody },
-        { heading: 'Neutral Fee Explainer', content: feeExplainerBullets.map((b, i) => `${i + 1}. ${b}`).join('\n') },
-        { heading: 'Verified Sources', content: feeExplainerSources.map((s) => `${s.title} — ${s.url}`).join('\n') },
-      ],
-    },
+    title: 'Append to Google Doc — Weekly Product Pulse',
+    summary: 'Append one structured dated entry to the existing document. The server must use an idempotency key to avoid duplicate entries.',
+    payload: { operation: 'append_entry', docTitle: pulseTitle, entry: structuredEntry },
   };
 
   const notion: McpAction = {
     id: makeActionId(),
     type: 'notion',
-    title: 'Create Notion page — Top 3 Themes + Fee Evidence',
-    summary: 'Create a Notion page listing the top 3 themes, representative quotes, and fee-related evidence items.',
-    payload: {
-      pageTitle: 'ChatGPT Voice Mode — Weekly Review Synthesis',
-      topThemes,
-    },
+    title: 'Append to Notion — Weekly Product Pulse',
+    summary: 'Append the structured dated entry to the configured Notion page; preserve existing content.',
+    payload: { operation: 'append_entry', pageTitle: 'ChatGPT Voice Mode — Weekly Review Synthesis', entry: structuredEntry },
   };
 
   const emailDraft: McpAction = {
     id: makeActionId(),
     type: 'email-draft',
-    title: 'Create Email Draft (DO NOT SEND) — Pulse summary',
-    summary: 'Create a DRAFT email summarizing the pulse. No email is sent. A human must approve and send manually.',
+    title: 'Create Gmail Draft (DO NOT SEND)',
+    summary: 'Create a Gmail draft only. This action must never send an email.',
     payload: {
       to: recipient ?? 'product-team@example.com',
-      subject: pulseTitle,
-      body: `${pulseBody}\n\nFee explainer:\n${feeExplainerBullets.map((b, i) => `${i + 1}. ${b}`).join('\n')}`,
+      subject: `Weekly Product Pulse + Customer Clarification — ${date}`,
+      body: [
+        'Weekly Product Pulse',
+        pulseBody,
+        '',
+        'Fee clarification',
+        ...explanation.map((bullet, index) => `${index + 1}. ${bullet}`),
+        '',
+        'Official source links',
+        ...sourceLinks.map((source) => `- ${source.title}: ${source.url}`),
+      ].join('\n'),
     },
   };
 
@@ -64,23 +76,55 @@ export function buildMcpActions(params: {
 
 export type McpExecutor = (action: McpAction) => Promise<McpResult>;
 
-export const mockMcpExecutor: McpExecutor = async (action): Promise<McpResult> => {
-  await new Promise((resolve) => setTimeout(resolve, 250));
-  const ref = `mock-${action.type}-${Math.floor(Math.random() * 100000)}`;
+/**
+ * Sends only to a server-side integration endpoint. Provider credentials must never
+ * be stored in VITE_* variables or sent to the browser. Missing configuration fails closed.
+ */
+export const configuredMcpExecutor: McpExecutor = async (action) => {
+  const endpoint = import.meta.env.VITE_MCP_ACTIONS_ENDPOINT as string | undefined;
+  if (!endpoint) {
+    return {
+      actionId: action.id,
+      success: false,
+      message: 'Integration is not configured. Set VITE_MCP_ACTIONS_ENDPOINT to your authenticated server-side MCP gateway; no external action was attempted.',
+    };
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action }),
+      signal: AbortSignal.timeout(20_000),
+    });
+  } catch {
+    return { actionId: action.id, success: false, message: 'Integration endpoint timed out or could not be reached. Verify provider state before retrying.' };
+  }
+
+  if (!response.ok) {
+    const message = response.status === 401 || response.status === 403
+      ? 'Integration authentication/authorization failed. No success was recorded.'
+      : `Integration endpoint returned HTTP ${response.status}. Verify provider state before retrying.`;
+    return { actionId: action.id, success: false, message };
+  }
+
+  let data: unknown;
+  try {
+    data = await response.json();
+  } catch {
+    return { actionId: action.id, success: false, message: 'Integration endpoint returned an invalid response; completion could not be confirmed.' };
+  }
+
+  if (!data || typeof data !== 'object' || !('success' in data) || (data as { success?: unknown }).success !== true) {
+    return { actionId: action.id, success: false, message: 'The endpoint did not confirm success. Check provider state before retrying.' };
+  }
+  const result = data as { message?: unknown; reference?: unknown };
   return {
     actionId: action.id,
     success: true,
-    message: `Mock write succeeded for ${action.type}. No real external system was contacted.`,
-    mockRef: ref,
-  };
-};
-
-export const failingMockMcpExecutor: McpExecutor = async (action): Promise<McpResult> => {
-  await new Promise((resolve) => setTimeout(resolve, 50));
-  return {
-    actionId: action.id,
-    success: false,
-    message: `Mock ${action.type} write failed (simulated). No real external system was contacted.`,
+    message: typeof result.message === 'string' ? result.message : 'The integration endpoint confirmed completion.',
+    ...(typeof result.reference === 'string' ? { mockRef: result.reference } : {}),
   };
 };
 
@@ -89,18 +133,13 @@ export async function executeMcpActions(
   approvedIds: Set<string>,
   executor: McpExecutor,
 ): Promise<McpResult[]> {
-  const approved = actions.filter((a) => approvedIds.has(a.id));
+  const approved = actions.filter((action) => approvedIds.has(action.id));
   const results: McpResult[] = [];
   for (const action of approved) {
     try {
-      const result = await executor(action);
-      results.push(result);
-    } catch (err) {
-      results.push({
-        actionId: action.id,
-        success: false,
-        message: `Unexpected error: ${err instanceof Error ? err.message : 'unknown error'}`,
-      });
+      results.push(await executor(action));
+    } catch {
+      results.push({ actionId: action.id, success: false, message: 'Unexpected integration error. Verify provider state before retrying.' });
     }
   }
   return results;
@@ -110,6 +149,6 @@ export function actionTypeLabel(type: McpActionType): string {
   switch (type) {
     case 'google-docs': return 'Google Docs';
     case 'notion': return 'Notion';
-    case 'email-draft': return 'Email Draft';
+    case 'email-draft': return 'Gmail Draft';
   }
 }
